@@ -28,6 +28,32 @@ pub(crate) fn maybe_location(
     }
 }
 
+/// Returns the tightest span covering all of the given spans, ignoring any that are unknown;
+/// `None` if none of them is known.
+///
+/// Unlike spanning from a first child to a last with [`maybe_location`], this doesn't assume
+/// the textual end of a node is where its last constituent ends. A here-document breaks that
+/// assumption: its body lies past the end of the line its operator is on, so it can end past
+/// constituents that follow it in the grammar — in `{ cat <<EOF; }` followed by a body, the
+/// body ends past the `}` that closes the brace group.
+pub(crate) fn union_spans<I>(spans: I) -> Option<SourceSpan>
+where
+    I: IntoIterator<Item = Option<SourceSpan>>,
+{
+    spans.into_iter().flatten().reduce(|acc, span| SourceSpan {
+        start: if span.start.index < acc.start.index {
+            span.start
+        } else {
+            acc.start
+        },
+        end: if span.end.index > acc.end.index {
+            span.end
+        } else {
+            acc.end
+        },
+    })
+}
+
 /// Represents a complete shell program.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -44,15 +70,7 @@ impl Node for Program {}
 
 impl SourceLocation for Program {
     fn location(&self) -> Option<SourceSpan> {
-        let start = self
-            .complete_commands
-            .first()
-            .and_then(SourceLocation::location);
-        let end = self
-            .complete_commands
-            .last()
-            .and_then(SourceLocation::location);
-        maybe_location(start.as_ref(), end.as_ref())
+        union_spans(self.complete_commands.iter().map(SourceLocation::location))
     }
 }
 
@@ -117,14 +135,10 @@ impl Node for AndOrList {}
 
 impl SourceLocation for AndOrList {
     fn location(&self) -> Option<SourceSpan> {
-        let start = self.first.location();
-        let last = self.additional.last();
-        let end = last.and_then(SourceLocation::location);
-
-        match (start, end) {
-            (Some(s), Some(e)) => Some(SourceSpan::within(&s, &e)),
-            (start, _) => start,
-        }
+        union_spans(
+            std::iter::once(self.first.location())
+                .chain(self.additional.iter().map(SourceLocation::location)),
+        )
     }
 }
 
@@ -328,14 +342,10 @@ impl Node for Pipeline {}
 // TODO(source-location): Handle the case where `self.timed` is `None` but there is a bang.
 impl SourceLocation for Pipeline {
     fn location(&self) -> Option<SourceSpan> {
-        let start = self
-            .timed
-            .as_ref()
-            .and_then(SourceLocation::location)
-            .or_else(|| self.seq.first().and_then(SourceLocation::location));
-        let end = self.seq.last().and_then(SourceLocation::location);
-
-        maybe_location(start.as_ref(), end.as_ref())
+        union_spans(
+            std::iter::once(self.timed.as_ref().and_then(SourceLocation::location))
+                .chain(self.seq.iter().map(SourceLocation::location)),
+        )
     }
 }
 
@@ -383,10 +393,7 @@ impl SourceLocation for Command {
         match self {
             Self::Simple(s) => s.location(),
             Self::Compound(c, r) => {
-                match (c.location(), r.as_ref().and_then(SourceLocation::location)) {
-                    (Some(s), Some(e)) => Some(SourceSpan::within(&s, &e)),
-                    (s, _) => s,
-                }
+                union_spans([c.location(), r.as_ref().and_then(SourceLocation::location)])
             }
             Self::Function(f) => f.location(),
         }
@@ -540,7 +547,9 @@ impl Node for SubshellCommand {}
 
 impl SourceLocation for SubshellCommand {
     fn location(&self) -> Option<SourceSpan> {
-        Some(self.loc.clone())
+        // The stored span runs from `(` to `)`; a here-document body inside the list can end
+        // past the `)`.
+        union_spans([Some(self.loc.clone()), self.list.location()])
     }
 }
 
@@ -574,7 +583,7 @@ impl Node for ForClauseCommand {}
 
 impl SourceLocation for ForClauseCommand {
     fn location(&self) -> Option<SourceSpan> {
-        Some(self.loc.clone())
+        union_spans([Some(self.loc.clone()), self.body.location()])
     }
 }
 
@@ -622,7 +631,7 @@ impl Node for ArithmeticForClauseCommand {}
 
 impl SourceLocation for ArithmeticForClauseCommand {
     fn location(&self) -> Option<SourceSpan> {
-        Some(self.loc.clone())
+        union_spans([Some(self.loc.clone()), self.body.location()])
     }
 }
 
@@ -673,7 +682,12 @@ impl Node for CaseClauseCommand {}
 
 impl SourceLocation for CaseClauseCommand {
     fn location(&self) -> Option<SourceSpan> {
-        Some(self.loc.clone())
+        // The stored span runs from `case` to `esac`; a here-document body inside a case item
+        // can end past the `esac`.
+        union_spans(
+            std::iter::once(Some(self.loc.clone()))
+                .chain(self.cases.iter().map(SourceLocation::location)),
+        )
     }
 }
 
@@ -703,14 +717,7 @@ impl Node for CompoundList {}
 // TODO(source-location): Handle the optional trailing separator.
 impl SourceLocation for CompoundList {
     fn location(&self) -> Option<SourceSpan> {
-        let start = self.0.first().and_then(SourceLocation::location);
-        let end = self.0.last().and_then(SourceLocation::location);
-
-        if let (Some(s), Some(e)) = (start, end) {
-            Some(SourceSpan::within(&s, &e))
-        } else {
-            None
-        }
+        union_spans(self.0.iter().map(SourceLocation::location))
     }
 }
 
@@ -814,7 +821,25 @@ impl Node for IfClauseCommand {}
 
 impl SourceLocation for IfClauseCommand {
     fn location(&self) -> Option<SourceSpan> {
-        Some(self.loc.clone())
+        // The stored span runs from `if` to `fi`; a here-document body in the condition or in
+        // a branch can end past the `fi`.
+        union_spans(
+            [
+                Some(self.loc.clone()),
+                self.condition.location(),
+                self.then.location(),
+            ]
+            .into_iter()
+            .chain(self.elses.iter().flatten().flat_map(|else_clause| {
+                [
+                    else_clause
+                        .condition
+                        .as_ref()
+                        .and_then(SourceLocation::location),
+                    else_clause.body.location(),
+                ]
+            })),
+        )
     }
 }
 
@@ -899,7 +924,7 @@ impl Node for CoprocessCommand {}
 
 impl SourceLocation for CoprocessCommand {
     fn location(&self) -> Option<SourceSpan> {
-        Some(self.loc.clone())
+        union_spans([Some(self.loc.clone()), self.body.location()])
     }
 }
 
@@ -936,7 +961,10 @@ impl Node for CaseItem {}
 
 impl SourceLocation for CaseItem {
     fn location(&self) -> Option<SourceSpan> {
-        self.loc.clone()
+        union_spans([
+            self.loc.clone(),
+            self.cmd.as_ref().and_then(SourceLocation::location),
+        ])
     }
 }
 
@@ -1001,7 +1029,7 @@ impl Node for WhileOrUntilClauseCommand {}
 
 impl SourceLocation for WhileOrUntilClauseCommand {
     fn location(&self) -> Option<SourceSpan> {
-        Some(self.2.clone())
+        union_spans([Some(self.2.clone()), self.0.location(), self.1.location()])
     }
 }
 
@@ -1031,14 +1059,10 @@ impl Node for FunctionDefinition {}
 // precede the function name.
 impl SourceLocation for FunctionDefinition {
     fn location(&self) -> Option<SourceSpan> {
-        let start = self.fname.location();
-        let end = self.body.location();
-
-        if let (Some(s), Some(e)) = (start, end) {
-            Some(SourceSpan::within(&s, &e))
-        } else {
-            None
-        }
+        maybe_location(
+            self.fname.location().as_ref(),
+            self.body.location().as_ref(),
+        )
     }
 }
 
@@ -1063,18 +1087,11 @@ impl Node for FunctionBody {}
 
 impl SourceLocation for FunctionBody {
     fn location(&self) -> Option<SourceSpan> {
-        let cmd_span = self.0.location();
-        let redirect_span = self.1.as_ref().and_then(SourceLocation::location);
-
-        match (cmd_span, redirect_span) {
-            // If there's a redirect, include it in the span.
-            (Some(cmd_span), Some(redirect_span)) => {
-                Some(SourceSpan::within(&cmd_span, &redirect_span))
-            }
-            // Otherwise, just return the command span.
-            (Some(cmd_span), None) => Some(cmd_span),
-            _ => None,
-        }
+        // If there's a redirect, include it in the span.
+        union_spans([
+            self.0.location(),
+            self.1.as_ref().and_then(SourceLocation::location),
+        ])
     }
 }
 
@@ -1107,7 +1124,9 @@ impl Node for BraceGroupCommand {}
 
 impl SourceLocation for BraceGroupCommand {
     fn location(&self) -> Option<SourceSpan> {
-        Some(self.loc.clone())
+        // The stored span runs from `{` to `}`; a here-document body inside the list can end
+        // past the `}` (`{ cat <<EOF; }` with the body on the following lines).
+        union_spans([Some(self.loc.clone()), self.list.location()])
     }
 }
 
@@ -1138,6 +1157,14 @@ pub struct DoGroupCommand {
     pub list: CompoundList,
     /// Location of the group
     pub loc: SourceSpan,
+}
+
+impl SourceLocation for DoGroupCommand {
+    fn location(&self) -> Option<SourceSpan> {
+        // The stored span runs from `do` to `done`; a here-document body inside the list can
+        // end past the `done`.
+        union_spans([Some(self.loc.clone()), self.list.location()])
+    }
 }
 
 impl Display for DoGroupCommand {
@@ -1185,21 +1212,13 @@ impl Node for SimpleCommand {}
 
 impl SourceLocation for SimpleCommand {
     fn location(&self) -> Option<SourceSpan> {
-        let mid = &self
-            .word_or_name
-            .as_ref()
-            .and_then(SourceLocation::location);
-        let start = self.prefix.as_ref().and_then(SourceLocation::location);
-        let end = self.suffix.as_ref().and_then(SourceLocation::location);
-
-        match (start, mid, end) {
-            (Some(start), _, Some(end)) => Some(SourceSpan::within(&start, &end)),
-            (Some(start), Some(mid), None) => Some(SourceSpan::within(&start, mid)),
-            (Some(start), None, None) => Some(start),
-            (None, Some(mid), Some(end)) => Some(SourceSpan::within(mid, &end)),
-            (None, Some(mid), None) => Some(mid.clone()),
-            _ => None,
-        }
+        union_spans([
+            self.prefix.as_ref().and_then(SourceLocation::location),
+            self.word_or_name
+                .as_ref()
+                .and_then(SourceLocation::location),
+            self.suffix.as_ref().and_then(SourceLocation::location),
+        ])
     }
 }
 
@@ -1250,10 +1269,7 @@ impl Node for CommandPrefix {}
 
 impl SourceLocation for CommandPrefix {
     fn location(&self) -> Option<SourceSpan> {
-        let start = self.0.first().and_then(SourceLocation::location);
-        let end = self.0.last().and_then(SourceLocation::location);
-
-        maybe_location(start.as_ref(), end.as_ref())
+        union_spans(self.0.iter().map(SourceLocation::location))
     }
 }
 
@@ -1283,10 +1299,7 @@ impl Node for CommandSuffix {}
 
 impl SourceLocation for CommandSuffix {
     fn location(&self) -> Option<SourceSpan> {
-        let start = self.0.first().and_then(SourceLocation::location);
-        let end = self.0.last().and_then(SourceLocation::location);
-
-        maybe_location(start.as_ref(), end.as_ref())
+        union_spans(self.0.iter().map(SourceLocation::location))
     }
 }
 
@@ -1511,9 +1524,7 @@ impl Node for RedirectList {}
 
 impl SourceLocation for RedirectList {
     fn location(&self) -> Option<SourceSpan> {
-        let first = self.0.first().and_then(SourceLocation::location);
-        let last = self.0.last().and_then(SourceLocation::location);
-        maybe_location(first.as_ref(), last.as_ref())
+        union_spans(self.0.iter().map(SourceLocation::location))
     }
 }
 
@@ -1549,10 +1560,16 @@ pub enum IoRedirect {
 
 impl Node for IoRedirect {}
 
+// TODO(source-location): account for the redirection operator and any fd number, which don't
+// carry locations yet; the span starts at the first located component after them.
 impl SourceLocation for IoRedirect {
     fn location(&self) -> Option<SourceSpan> {
-        // TODO(source-location): complete
-        None
+        match self {
+            Self::File(_, _, target) => target.location(),
+            Self::HereDocument(_, here_doc) => here_doc.location(),
+            Self::HereString(_, word) => word.location(),
+            Self::OutputAndError(word, _) => word.location(),
+        }
     }
 }
 
@@ -1652,6 +1669,17 @@ pub enum IoFileRedirectTarget {
     Duplicate(Word),
 }
 
+impl SourceLocation for IoFileRedirectTarget {
+    fn location(&self) -> Option<SourceSpan> {
+        match self {
+            Self::Filename(word) | Self::Duplicate(word) => word.location(),
+            // TODO(source-location): account for the substitution's kind sigil
+            Self::ProcessSubstitution(_, subshell) => subshell.location(),
+            Self::Fd(_) => None,
+        }
+    }
+}
+
 impl Display for IoFileRedirectTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1693,10 +1721,14 @@ pub struct IoHereDocument {
 
 impl Node for IoHereDocument {}
 
+// TODO(source-location): account for the line holding the terminating tag, whose location
+// isn't kept; the span ends where the body's text does, at the start of that line.
 impl SourceLocation for IoHereDocument {
     fn location(&self) -> Option<SourceSpan> {
-        // TODO(source-location): complete
-        None
+        // From the tag naming the here-document through its body. The body makes every span
+        // containing it end past the rest of its command's line (and past the delimiters of
+        // any construct the command closes on that line).
+        union_spans([self.here_end.location(), self.doc.location()])
     }
 }
 

@@ -325,6 +325,15 @@ struct ExpansionFrame {
     here_state: HereState,
     /// Ordered queue of here tags for which we're still looking for matching here-document bodies.
     current_here_tags: Vec<HereTag>,
+    /// Where the line now being read of a here-document body started; tracked while reading
+    /// bodies so the body token's span can end where its text does, rather than at the cursor
+    /// (which is past the end tag's line by the time the body is delimited).
+    here_doc_line_start: Option<SourcePosition>,
+    /// End positions for the two tokens of a here-document just completed: where its body's
+    /// text ended and where its end tag's text ended. Recorded by
+    /// [`Tokenizer::remove_here_end_tag`] when it recognizes the tag, and consumed when the
+    /// tokens are popped ([`TokenParseState::delimit_current_token`]).
+    here_doc_token_ends: Option<(SourcePosition, SourcePosition)>,
     /// How many closing chars (see [`NestedExpansion::closing_char`]) the expansion needs
     /// before it ends. Its contents may use the closing char too, paired with an opener of
     /// their own (see [`NestedExpansion::opening_char`]); each opener read needs one more.
@@ -417,6 +426,11 @@ struct TokenParseState {
     pub token_is_operator: bool,
     pub in_escape: bool,
     pub quote_mode: QuoteMode,
+    /// A position the token's span must extend through even if it's delimited before it: set
+    /// when the body of a here-document left pending by a nested expansion is spliced into
+    /// the token from the lines following it (see
+    /// [`Tokenizer::read_here_doc_bodies_left_pending`]).
+    pub spans_through: Option<SourcePosition>,
 }
 
 impl TokenParseState {
@@ -427,11 +441,19 @@ impl TokenParseState {
             token_is_operator: false,
             in_escape: false,
             quote_mode: QuoteMode::None,
+            spans_through: None,
         }
     }
 
     pub fn pop(&mut self, end_position: &SourcePosition) -> Token {
-        let end = Arc::new(end_position.to_owned());
+        // The token's span must reach any text spliced into it from later lines (the bodies
+        // of here-documents a nested expansion left pending), even though the cursor was put
+        // back before that text to finish the line the token is on.
+        let spans_through = self
+            .spans_through
+            .take()
+            .filter(|through| through.index > end_position.index);
+        let end = Arc::new(spans_through.unwrap_or_else(|| end_position.to_owned()));
         let token_location = SourceSpan {
             start: Arc::new(std::mem::take(&mut self.start_position)),
             end,
@@ -601,6 +623,21 @@ impl TokenParseState {
                 // We hit the end of the current here-document.
                 let completed_here_tag = cross_token_state.frame.current_here_tags.remove(0);
 
+                // Where the body's text ends and where the end tag's text ends. The cursor
+                // itself is already past the newline that followed the end tag, so it bounds
+                // neither; [`Tokenizer::remove_here_end_tag`] recorded both positions when it
+                // recognized the tag.
+                let (body_end, end_tag_end) = cross_token_state
+                    .frame
+                    .here_doc_token_ends
+                    .take()
+                    .unwrap_or_else(|| {
+                        (
+                            cross_token_state.cursor.clone(),
+                            cross_token_state.cursor.clone(),
+                        )
+                    });
+
                 // First queue the redirection operator and (start) here-tag.
                 cross_token_state
                     .queued_tokens
@@ -615,7 +652,7 @@ impl TokenParseState {
                 // Then queue the body document we just finished.
                 cross_token_state.queued_tokens.push(TokenizeResult {
                     reason,
-                    token: Some(self.pop(&cross_token_state.cursor)),
+                    token: Some(self.pop(&body_end)),
                 });
 
                 // Then queue up the (end) here-tag.
@@ -627,8 +664,14 @@ impl TokenParseState {
                 self.append_str(end_tag.trim_end_matches('\n'));
                 cross_token_state.queued_tokens.push(TokenizeResult {
                     reason: TokenEndReason::HereDocumentEndTag,
-                    token: Some(self.pop(&cross_token_state.cursor)),
+                    token: Some(self.pop(&end_tag_end)),
                 });
+
+                // Whatever follows starts at the cursor (past the end tag's newline), not at
+                // the end of the tag's own text where the last pop left the start position.
+                cross_token_state
+                    .cursor
+                    .clone_into(&mut self.start_position);
 
                 // Now we're ready to queue up any tokens that came between the completed
                 // here tag and the next here tag (or newline after it if it was the last).
@@ -1006,13 +1049,26 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
         }
 
         // As when a line ends, the held tokens come out in order, with the bodies (and end
-        // tags) interleaved; the bodies go after all of them.
+        // tags) interleaved; the bodies go after all of them. The bodies become part of the
+        // token's text, so its span must reach through where their tokens end — the cursor is
+        // about to be put back on the tags' line to finish it, so the span the token is
+        // eventually popped with won't cover them on its own.
         self.cross_state.frame.here_state = HereState::InHereDocs;
         let mut bodies = String::new();
         while !matches!(self.cross_state.frame.here_state, HereState::None)
             || !self.cross_state.queued_tokens.is_empty()
         {
             let result = self.next_token()?;
+            if let Some(token) = &result.token {
+                let end = token.location().end.as_ref();
+                if state
+                    .spans_through
+                    .as_ref()
+                    .is_none_or(|through| through.index < end.index)
+                {
+                    state.spans_through = Some(end.clone());
+                }
+            }
             append_expansion_token(state, &mut bodies, &result);
         }
         state.append_str(&bodies);
@@ -1240,7 +1296,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                     // Only a body can end at an end tag. Outside one, an empty tag would
                     // "match" on every pass without making progress, looping forever.
                     if matches!(self.cross_state.frame.here_state, HereState::InHereDocs)
-                        && self.remove_here_end_tag(&mut state, &mut result, false)?
+                        && self.remove_here_end_tag(&mut state, &mut result, None)?
                     {
                         // If we hit end tag without a trailing newline, try to get next token.
                         continue;
@@ -1286,12 +1342,19 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                     // Consume it but don't include it.
                     self.consume_char()?;
                 } else {
+                    // Note where a newline is before consuming it: the line it ends may turn
+                    // out to be the end tag's, whose token span stops at the newline.
+                    let newline_position = (c == '\n').then(|| self.cross_state.cursor.clone());
                     self.consume_char()?;
                     state.append_char(c);
 
                     // See if this was a newline character following the terminating here tag.
-                    if c == '\n' {
-                        self.remove_here_end_tag(&mut state, &mut result, true)?;
+                    if let Some(newline_position) = newline_position {
+                        self.remove_here_end_tag(&mut state, &mut result, Some(&newline_position))?;
+                        // Whether or not that line was the end tag, the next line (the body's
+                        // next, or the first of the next here-document's body) starts here.
+                        self.cross_state.frame.here_doc_line_start =
+                            Some(self.cross_state.cursor.clone());
                     } else if c == '\\'
                         && self
                             .cross_state
@@ -1608,11 +1671,13 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
         Ok(result)
     }
 
+    /// `end_of_line` is the position of the newline that ended the line just read, or `None`
+    /// when the input ended without one.
     fn remove_here_end_tag(
         &mut self,
         state: &mut TokenParseState,
         result: &mut Option<TokenizeResult>,
-        ends_with_newline: bool,
+        end_of_line: Option<&SourcePosition>,
     ) -> Result<bool, TokenizerError> {
         // Bail immediately if we don't even have a *starting* here tag.
         if self.cross_state.frame.current_here_tags.is_empty() {
@@ -1627,7 +1692,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
             next_here_tag.tag.as_str().into()
         };
 
-        let tag_str = if !ends_with_newline {
+        let tag_str = if end_of_line.is_none() {
             tag_str
                 .strip_suffix('\n')
                 .unwrap_or_else(|| tag_str.as_ref())
@@ -1649,6 +1714,24 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
             if current_token_without_here_tag.is_empty()
                 || current_token_without_here_tag.ends_with('\n')
             {
+                // The body's text ends where the end tag's line starts: at the start of the
+                // token when the body is empty, otherwise at the line start noted after the
+                // body's final newline. The tag's own text ends at the line's newline, or at
+                // the cursor when the input ended without one.
+                let body_end = if current_token_without_here_tag.is_empty() {
+                    state.start_position.clone()
+                } else {
+                    self.cross_state
+                        .frame
+                        .here_doc_line_start
+                        .clone()
+                        .unwrap_or_else(|| self.cross_state.cursor.clone())
+                };
+                let end_tag_end = end_of_line
+                    .cloned()
+                    .unwrap_or_else(|| self.cross_state.cursor.clone());
+                self.cross_state.frame.here_doc_token_ends = Some((body_end, end_tag_end));
+
                 state.replace_with_here_doc(current_token_without_here_tag.to_owned());
 
                 // Delimit the end of the here-document body.
@@ -2017,6 +2100,33 @@ echo after
     }
 
     #[test]
+    fn tokenize_here_doc_body_and_end_tag_spans() -> Result<()> {
+        // The body token's span covers exactly the body's text, and the end tag token's its
+        // own text — not the cursor's position, which is already past the end tag's line (and
+        // its newline) by the time the two tokens are delimited.
+        let tokens = tokenize_str("cat <<HERE\nSOMETHING\nHERE\necho after\n")?;
+        let spans: Vec<_> = tokens
+            .iter()
+            .map(|t| (t.to_str(), t.location().start.index, t.location().end.index))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                ("cat", 0, 3),
+                ("<<", 4, 6),
+                ("HERE", 6, 10),
+                ("SOMETHING\n", 11, 21),
+                ("HERE", 21, 25),
+                ("\n", 10, 11),
+                ("echo", 26, 30),
+                ("after", 31, 36),
+                ("\n", 36, 37),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tokenize_unterminated_here_doc() {
         let result = tokenize_str(
             r"cat <<HERE
@@ -2224,6 +2334,11 @@ SOMETHING
                 ("\n", 4, 2),
             ]
         );
+
+        // The body is part of the substitution's text, so the word's span reaches through the
+        // end tag on line 3, even though the word itself is delimited on line 1.
+        let word_end = &tokens[1].location().end;
+        assert_eq!((word_end.line, word_end.column), (3, 4));
 
         Ok(())
     }

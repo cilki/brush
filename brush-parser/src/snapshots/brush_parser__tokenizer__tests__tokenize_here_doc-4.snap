@@ -48,16 +48,16 @@ TokenizerResult(
         column: 1,
       ),
       end: SourcePosition(
-        index: 25,
+        index: 21,
         line: 3,
-        column: 5,
+        column: 1,
       ),
     )),
     Word("HERE", SourceSpan(
       start: SourcePosition(
-        index: 25,
+        index: 21,
         line: 3,
-        column: 5,
+        column: 1,
       ),
       end: SourcePosition(
         index: 25,

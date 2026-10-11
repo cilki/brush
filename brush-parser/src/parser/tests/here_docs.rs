@@ -164,3 +164,35 @@ fn parse_here_doc_left_open_in_nested_command_substitution() -> Result<()> {
     });
     Ok(())
 }
+
+#[test]
+fn parse_here_doc_spans_cover_the_body() {
+    use crate::ast::{Command, SourceLocation};
+
+    // A here-document's body lies past the rest of its command's line — including the closing
+    // delimiter of any construct that line finishes. Spans must extend through the body: a
+    // consumer slicing source text by a function's span would otherwise cut the body off,
+    // leaving an unterminated here-document that swallows whatever text follows the function.
+    let input = "f() { cat <<DONE; }\nbody line\nDONE\ng() { :; }\n";
+    let program = test_with_snapshot(input).unwrap();
+
+    let functions: Vec<_> = program
+        .complete_commands
+        .iter()
+        .flat_map(|command| command.0.iter())
+        .filter_map(|item| match item.0.first.seq.first() {
+            Some(Command::Function(f)) => {
+                let span = f.location().unwrap();
+                Some((f.fname.value.clone(), span.start.line, span.end.line))
+            }
+            _ => None,
+        })
+        .collect();
+
+    // `f`'s span runs through the line holding the terminating tag; `g` is unaffected.
+    assert_eq!(
+        functions,
+        [("f".into(), 1, 3), ("g".into(), 4, 4)],
+        "for {input:?}"
+    );
+}
